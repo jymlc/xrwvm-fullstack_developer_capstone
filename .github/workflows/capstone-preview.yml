@@ -1,0 +1,119 @@
+name: Capture Cars Dealership public preview
+on:
+  push:
+    paths:
+      - '.github/workflows/capstone-preview.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  capstone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install services and build React
+        run: |
+          pip install -r server/requirements.txt playwright
+          npm install --prefix server/database --no-audit --no-fund
+          npm install --prefix server/frontend --no-audit --no-fund --legacy-peer-deps
+          npm run build --prefix server/frontend
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb xauth scrot
+      - name: Check Django and seed the SQLite catalog
+        working-directory: server
+        run: |
+          python manage.py check
+          python manage.py makemigrations djangoapp
+          python manage.py migrate
+          python verify_capstone.py seed
+      - name: Capture the temporary HTTPS deployment
+        working-directory: server
+        run: |
+          mkdir -p ../evidence
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          /tmp/cloudflared tunnel --url http://127.0.0.1:8000 --no-autoupdate > tunnel.log 2>&1 &
+          tunnel=$!
+          trap 'cat tunnel.log django-service.log 2>/dev/null || true; kill "$tunnel" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            url=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+            test -z "$url" || break
+            sleep 2
+          done
+          test -n "$url"
+          export CAPSTONE_URL="$url"
+          export DJANGO_ALLOWED_HOSTS="${url#https://},127.0.0.1,localhost"
+          export DJANGO_SETTINGS_MODULE=djangoproj.preview_settings
+          export DJANGO_SECRET_KEY="$(openssl rand -hex 32)"
+          export CAPSTONE_PASSWORD="$(openssl rand -hex 24)"
+          cat > djangoproj/preview_settings.py <<'PY'
+          import os
+          from .settings import *
+          DEBUG = False
+          SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+          CSRF_TRUSTED_ORIGINS = [os.environ['CAPSTONE_URL']]
+          SESSION_COOKIE_SECURE = True
+          CSRF_COOKIE_SECURE = True
+          PY
+          python manage.py shell -c "from django.contrib.auth import get_user_model; import os; U=get_user_model(); U.objects.filter(username='root').delete(); u=U.objects.get(username='demo_driver'); u.set_password(os.environ['CAPSTONE_PASSWORD']); u.save()"
+          python manage.py collectstatic --noinput
+          node database/app.js > dealer-service.log 2>&1 &
+          python -m flask --app sentiment run --port 5050 > sentiment-service.log 2>&1 &
+          python -m gunicorn --bind 127.0.0.1:8000 djangoproj.wsgi:application > django-service.log 2>&1 &
+          curl -fsS --retry 20 --retry-all-errors --retry-delay 2 "$url/djangoapp/get_dealers" >/dev/null
+          xvfb-run --server-args="-screen 0 1280x900x24" python - <<'PY'
+          import os
+          import subprocess
+          from playwright.sync_api import expect, sync_playwright
+
+          url = os.environ['CAPSTONE_URL']
+
+          def shot(page, name):
+              assert page.url.startswith(url + '/')
+              page.bring_to_front()
+              page.evaluate("() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))")
+              subprocess.run(['scrot', '-o', '../evidence/' + name + '.png'], check=True)
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=False, channel='chrome',
+                  args=['--window-position=0,0', '--window-size=1280,900'])
+              page = browser.new_context(no_viewport=True).new_page()
+              page.goto(url + '/')
+              expect(page.get_by_role('link', name='Holdlamis Car Dealership')).to_be_visible()
+              shot(page, 'deployed_landingpage')
+              page.get_by_role('link', name='Log in').click()
+              page.get_by_label('Username').fill('demo_driver')
+              page.get_by_label('Password').fill(os.environ['CAPSTONE_PASSWORD'])
+              page.get_by_role('button', name='Log in').click()
+              expect(page.get_by_text('demo_driver', exact=True)).to_be_visible()
+              expect(page.get_by_role('link', name='Review Dealer').first).to_be_visible()
+              shot(page, 'deployed_loggedin')
+              page.goto(url + '/dealer/15')
+              expect(page.get_by_text('Total grid-enabled service-desk')).to_be_visible()
+              shot(page, 'deployed_dealer_detail')
+              page.get_by_role('link', name='Review Dealer').click()
+              review = 'Fantastic services. The staff explained the options and made the visit easy.'
+              page.get_by_label('Review', exact=True).fill(review)
+              page.get_by_label('Car make and model').select_option(label='Honda Civic (2024)')
+              page.get_by_role('button', name='Submit review').click()
+              expect(page.get_by_text(review, exact=True)).to_be_visible()
+              shot(page, 'deployed_add_review')
+              browser.close()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deployed-capstone-screenshots
+          path: evidence/deployed_*.png
+          if-no-files-found: error
