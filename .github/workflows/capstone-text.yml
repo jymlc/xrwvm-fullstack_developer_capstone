@@ -1,0 +1,66 @@
+name: Print verified capstone text answers
+on:
+  push:
+    paths:
+      - '.github/workflows/capstone-text.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  capstone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install services and build React
+        run: |
+          pip install -r server/requirements.txt playwright
+          npm install --prefix server/database --no-audit --no-fund
+          npm install --prefix server/frontend --no-audit --no-fund --legacy-peer-deps
+          npm run build --prefix server/frontend
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb xauth scrot
+      - name: Check Django and seed the SQLite catalog
+        working-directory: server
+        run: |
+          python manage.py check
+          python manage.py makemigrations djangoapp
+          python manage.py migrate
+          python verify_capstone.py seed
+      - name: Verify live services with cURL and browser
+        working-directory: server
+        run: |
+          mkdir -p ../evidence
+          node database/app.js > dealer-service.log 2>&1 &
+          python -m flask --app sentiment run --port 5050 > sentiment-service.log 2>&1 &
+          python -u manage.py runserver 127.0.0.1:8000 --noreload > django-service.log 2>&1 &
+          trap 'cat dealer-service.log sentiment-service.log django-service.log' EXIT
+          curl -fsS --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:3030/ >/dev/null
+          curl -fsS --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:5050/analyze/Great >/dev/null
+          curl -fsS --retry 20 --retry-all-errors --retry-delay 1 http://127.0.0.1:8000/djangoapp/session >/dev/null
+          { echo '$ python manage.py runserver 127.0.0.1:8000 --noreload'; cat django-service.log; } > ../evidence/django_server.txt
+          python verify_capstone.py evidence
+          for file in ../evidence/*.txt; do
+            echo "ANSWER_START $(basename "$file")"
+            cat "$file"
+            echo "ANSWER_END"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: cars-dealership-submission-evidence
+          path: |
+            evidence/*.png
+            evidence/*.txt
+          if-no-files-found: error
