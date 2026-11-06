@@ -79,12 +79,12 @@ def register_user(request):
                             last_name=data['lastName'], email=data['email'])
     try:
         validate_email(user.email)
-        user.full_clean(validate_unique=False)
         validate_password(data['password'], user)
+        user.set_password(data['password'])
+        user.full_clean(validate_unique=False)
     except ValidationError as error:
         return JsonResponse({'error': ' '.join(error.messages)}, status=400)
     try:
-        user.set_password(data['password'])
         user.save()
     except IntegrityError:
         return JsonResponse({'error': 'Username is already registered.'}, status=409)
